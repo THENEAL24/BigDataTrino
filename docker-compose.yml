@@ -1,0 +1,95 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: bigdata-trino-lab4-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: lab_db
+    ports:
+      - "15432:5432"
+    volumes:
+      - ./init/postgres:/docker-entrypoint-initdb.d:ro
+      - ./data:/var/lib/postgresql/data_files:ro
+    networks:
+      - trino-net
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: bigdata-trino-lab4-clickhouse
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "18123:8123"
+      - "19000:9000"
+    volumes:
+      - ./init/clickhouse:/clickhouse-init:ro
+      - ./data:/data/csv:ro
+    networks:
+      - trino-net
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  clickhouse-init:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: bigdata-trino-lab4-clickhouse-init
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      - ./init/clickhouse:/clickhouse-init:ro
+      - ./data:/data/csv:ro
+    networks:
+      - trino-net
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        echo "Ожидание ClickHouse..."
+        for i in $$(seq 1 90); do
+          if clickhouse-client --host clickhouse --query "SELECT 1" 2>/dev/null; then
+            break
+          fi
+          sleep 1
+          if [ "$$i" -eq 90 ]; then
+            echo "ClickHouse недоступен"
+            exit 1
+          fi
+        done
+        clickhouse-client --host clickhouse --multiquery < /clickhouse-init/00_databases.sql
+        clickhouse-client --host clickhouse --multiquery < /clickhouse-init/01_mock_data_string.sql
+        for f in "MOCK_DATA.csv" "MOCK_DATA (1).csv" "MOCK_DATA (2).csv" "MOCK_DATA (3).csv" "MOCK_DATA (4).csv"; do
+          path="/data/csv/$$f"
+          echo "Загрузка $$path в default.mock_data ..."
+          clickhouse-client --host clickhouse \
+            --input_format_parallel_parsing=0 \
+            --date_time_input_format=best_effort \
+            --query="INSERT INTO default.mock_data FORMAT CSVWithNames" < "$$path"
+        done
+        cnt=$$(clickhouse-client --host clickhouse --query "SELECT count() FROM default.mock_data")
+        echo "Строк в default.mock_data: $$cnt"
+
+  trino:
+    image: trinodb/trino:453
+    container_name: bigdata-trino-lab4-trino
+    ports:
+      - "18080:8080"
+    volumes:
+      - ./trino/etc:/etc/trino:ro
+      - ./trino/sql:/sql:ro
+    depends_on:
+      postgres:
+        condition: service_started
+      clickhouse-init:
+        condition: service_completed_successfully
+    networks:
+      - trino-net
+
+networks:
+  trino-net:
+    driver: bridge
